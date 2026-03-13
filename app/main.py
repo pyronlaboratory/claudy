@@ -79,6 +79,7 @@ def main():
                 })
         else:
             print(message.content)
+            break
 
 
 if __name__ == "__main__":
