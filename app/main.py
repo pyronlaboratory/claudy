@@ -92,7 +92,7 @@ def main():
                     result = f.read()
             
             elif func_name == "Write":
-                with open(args["file_path"], "w") as f:
+                with open(file_path, "w") as f:
                     f.write(args["content"])
                 result = "File written successfully"
 
