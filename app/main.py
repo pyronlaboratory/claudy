@@ -23,7 +23,7 @@ def main():
     while True:
         chat = client.chat.completions.create(
             model="anthropic/claude-haiku-4.5",
-            messages=[{"role": "user", "content": args.p}],
+            messages=messages, # [{"role": "user", "content": args.p}]
             max_tokens=1024,
             tools=[
                 {
