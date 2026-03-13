@@ -18,7 +18,6 @@ def main():
         raise RuntimeError("OPENROUTER_API_KEY is not set")
 
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-
     messages = [{"role": "user", "content": args.p}]
     while True:
         chat = client.chat.completions.create(
@@ -40,6 +39,27 @@ def main():
                                 }
                             },
                             "required": ["file_path"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Write",
+                        "description": "Write content to a file",
+                        "parameters": {
+                            "type": "object",
+                            "required": ["file_path", "content"],
+                            "properties": {
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "The path of the file to write to"
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "The content to write to the file"
+                                }
+                            }
                         }
                     }
                 }
@@ -69,14 +89,19 @@ def main():
             if func_name == "Read":
                 file_path = json.loads(func_args)["file_path"]
                 with open(file_path, "r") as f:
-                    content = f.read()
-                
-                # print(content)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": content
-                })
+                    result = f.read()
+            
+            elif func_name == "Write":
+                with open(args["file_path"], "w") as f:
+                    f.write(args["content"])
+                result = "File written successfully"
+
+            # print(result)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result
+            })
         else:
             print(message.content)
             break
