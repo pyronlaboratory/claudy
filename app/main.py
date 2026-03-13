@@ -84,15 +84,14 @@ def main():
             
             # Parse the function name and args
             func_name = tool_call.function.name
-            func_args = tool_call.function.arguments
+            args = json.loads(tool_call.function.arguments)
 
             if func_name == "Read":
-                file_path = json.loads(func_args)["file_path"]
-                with open(file_path, "r") as f:
+                with open(args["file_path"], "r") as f:
                     result = f.read()
             
             elif func_name == "Write":
-                with open(file_path, "w") as f:
+                with open(args["file_path"], "w") as f:
                     f.write(args["content"])
                 result = "File written successfully"
 
