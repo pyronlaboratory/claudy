@@ -80,6 +80,16 @@ def write_file(file_path, content):
         f.write(content)
     return "File written successfully"
 
+def run_bash(command):
+    result = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+    )
+
+    output = (result.stdout + result.stderr).strip()
+    return output or "Command executed successfully"
 
 def execute_tool(tool_call):
     func_name = tool_call.function.name
@@ -92,15 +102,7 @@ def execute_tool(tool_call):
         return write_file(args["file_path"], args["content"])
     
     if func_name == "Bash":
-        command = args["command"]
-        result = subprocess.run(
-            command, 
-            shell=True, 
-            capture_output=True, 
-            text=True
-        )
-        output = (result.stdout + result.stderr).strip()
-        return output or "Command executed successfully"
+        return run_bash(args["command"])
 
     raise RuntimeError(f"Unknown tool {func_name}")
 
