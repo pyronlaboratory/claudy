@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 
 from openai import OpenAI
 
@@ -94,8 +93,15 @@ def run_bash(command):
 
 
 def execute_tool(tool_call):
-    func_name = tool_call.function.name
-    args = json.loads(tool_call.function.arguments)
+    # Support both object-like tool calls from non-streaming and dicts from streaming
+    if hasattr(tool_call, "function"):
+        func_name = tool_call.function.name
+        args_str = tool_call.function.arguments
+    else:
+        func_name = tool_call["function"]["name"]
+        args_str = tool_call["function"]["arguments"]
+    
+    args = json.loads(args_str)
 
     if func_name == "Read":
         return read_file(args["file_path"])
@@ -109,44 +115,78 @@ def execute_tool(tool_call):
     raise RuntimeError(f"Unknown tool {func_name}")
 
 
-def call_llm(client, messages):
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=TOOLS,
-        max_tokens=1024
-    )
-
-    if not response.choices:
-        raise RuntimeError("no choices in response")
-
-    return response.choices[0].message
-
-
 def agent_loop(client, messages):
     while True:
-        print("Logs from your program will appear here!", file=sys.stderr)
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=1024,
+            stream=True
+        )
 
-        message = call_llm(client, messages)
-        messages.append(message)
+        full_content = ""
+        tool_calls_dict = {}
 
-        if message.tool_calls:
-            for tool_call in message.tool_calls:
-                result = execute_tool(tool_call)
+        for chunk in response:
+            if not chunk.choices:
+                continue
+            
+            delta = chunk.choices[0].delta
+            
+            if delta.content:
+                print(delta.content, end="", flush=True)
+                full_content += delta.content
+            
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_dict:
+                        tool_calls_dict[idx] = {
+                            "id": tc_delta.id,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        }
+                    
+                    if tc_delta.id:
+                        tool_calls_dict[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tool_calls_dict[idx]["function"]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_dict[idx]["function"]["arguments"] += tc_delta.function.arguments
 
+        if full_content:
+            print() # Newline after content stream
+
+        tool_calls = [tool_calls_dict[i] for i in sorted(tool_calls_dict.keys())]
+        
+        assistant_message = {
+            "role": "assistant",
+            "content": full_content or None,
+        }
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        
+        messages.append(assistant_message)
+
+        if tool_calls:
+            for tc in tool_calls:
+                result = execute_tool(tc)
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tc["id"],
                     "content": result
                 })
         else:
-            print(message.content)
             break
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-p", help="Prompt string")
+    group.add_argument("--file", help="Path to prompt file")
     return parser.parse_args()
 
 
@@ -157,8 +197,14 @@ def main():
         raise RuntimeError("OPENROUTER_API_KEY is not set")
 
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-    
-    messages = [{"role": "user", "content": args.p}]
+
+    if args.p:
+        prompt = args.p
+    else:
+        with open(args.file, "r") as f:
+            prompt = f.read()
+
+    messages = [{"role": "user", "content": prompt}]
 
     agent_loop(client, messages)
 
