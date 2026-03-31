@@ -4,9 +4,19 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
+from collections import defaultdict
+from dataclasses import dataclass, field
 
+import tiktoken
 from openai import OpenAI
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -14,6 +24,108 @@ BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 MODEL = "anthropic/claude-haiku-4.5"
 MAX_TOOL_OUTPUT_LENGTH = 10000
 MAX_MESSAGES = 20
+
+# Prices per 1M tokens
+PRICING = {
+    "anthropic/claude-haiku-4.5": {"input": 0.25, "output": 1.25},
+    "anthropic/claude-3.5-haiku": {"input": 0.25, "output": 1.25},
+    "anthropic/claude-3-haiku": {"input": 0.25, "output": 1.25},
+    "anthropic/claude-3.5-sonnet": {"input": 3.0, "output": 15.0},
+    "anthropic/claude-3-opus": {"input": 15.0, "output": 75.0},
+    "openai/gpt-4o": {"input": 2.5, "output": 10.0},
+    "openai/gpt-4o-mini": {"input": 0.15, "output": 0.6},
+    "google/gemini-2.0-flash-exp": {"input": 0.0, "output": 0.0},
+}
+
+DEFAULT_PRICING = {"input": 1.0, "output": 1.0}
+
+console = Console()
+
+@dataclass
+class CallStats:
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency: float = 0.0
+    cost: float = 0.0
+
+class SessionStats:
+    def __init__(self):
+        self.calls = []
+        self.start_time = time.time()
+
+    def add_call(self, model, input_tokens, output_tokens, latency):
+        pricing = PRICING.get(model, DEFAULT_PRICING)
+        cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000)
+        self.calls.append(CallStats(model, input_tokens, output_tokens, latency, cost))
+
+    def get_total_stats(self):
+        total_input = sum(c.input_tokens for c in self.calls)
+        total_output = sum(c.output_tokens for c in self.calls)
+        total_cost = sum(c.cost for c in self.calls)
+        total_latency = sum(c.latency for c in self.calls)
+        return total_input, total_output, total_cost, total_latency
+
+    def render_summary(self, last_call: CallStats):
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_row("Input Tokens", f"[cyan]{last_call.input_tokens}[/cyan]")
+        table.add_row("Output Tokens", f"[cyan]{last_call.output_tokens}[/cyan]")
+        table.add_row("Total Tokens", f"[cyan]{last_call.input_tokens + last_call.output_tokens}[/cyan]")
+        
+        cost_color = "green" if last_call.cost < 0.01 else "yellow"
+        table.add_row("Cost", f"[{cost_color}]${last_call.cost:.6f}[/{cost_color}]")
+        table.add_row("Latency", f"{last_call.latency:.2f}s")
+
+        console.print(Panel(table, title="[bold]Response Stats[/bold]", expand=False, border_style="dim"))
+
+    def render_session_stats(self):
+        if not self.calls:
+            return
+
+        table = Table(title="[bold not italic]Session Statistics[/]", title_justify="left", show_footer=True)
+        table.add_column("Model", footer="Total")
+        table.add_column("Input", justify="right", footer=str(sum(c.input_tokens for c in self.calls)))
+        table.add_column("Output", justify="right", footer=str(sum(c.output_tokens for c in self.calls)))
+        table.add_column("Cost", justify="right", footer=f"${sum(c.cost for c in self.calls):.6f}")
+        table.add_column("Latency", justify="right", footer=f"{sum(c.latency for c in self.calls):.2f}s")
+
+        # Group by model
+        by_model = defaultdict(lambda: {"input": 0, "output": 0, "cost": 0.0, "latency": 0.0})
+        for c in self.calls:
+            by_model[c.model]["input"] += c.input_tokens
+            by_model[c.model]["output"] += c.output_tokens
+            by_model[c.model]["cost"] += c.cost
+            by_model[c.model]["latency"] += c.latency
+
+        # Sort by cost descending
+        sorted_models = sorted(by_model.items(), key=lambda x: x[1]["cost"], reverse=True)
+
+        for model, stats in sorted_models:
+            table.add_row(
+                model,
+                str(stats["input"]),
+                str(stats["output"]),
+                f"${stats["cost"]:.6f}",
+                f"{stats["latency"]:.2f}s"
+            )
+
+        console.print(table)
+
+def count_tokens(text, model=MODEL):
+    try:
+        encoding = tiktoken.encoding_for_model("gpt-4o") # Fallback for estimation
+        return len(encoding.encode(text))
+    except:
+        return len(text) // 4 # Very rough fallback
+
+def get_messages_tokens(messages):
+    total = 0
+    for m in messages:
+        if m.get("content"):
+            total += count_tokens(m["content"])
+        if m.get("tool_calls"):
+            total += count_tokens(json.dumps(m["tool_calls"]))
+    return total
 
 TOOLS = [
     {
@@ -152,7 +264,7 @@ def write_file(file_path, content):
 def edit_file(file_path, old_str, new_str):
     try:
         content = read_file(file_path)
-        if content.startswith("Error reading file:"):
+        if isinstance(content, str) and content.startswith("Error reading file:"):
             return content
         
         if old_str not in content:
@@ -243,14 +355,25 @@ def execute_tool(tool_call):
     return result
 
 
-def summarize_content(client, content):
+def summarize_content(client, content, stats):
     prompt = f"Please provide a concise summary of the following content, focusing on key technical details relevant for a developer:\n\n{content[:MAX_TOOL_OUTPUT_LENGTH]}"
     try:
+        start_time = time.time()
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500
         )
+        latency = time.time() - start_time
+        
+        usage = response.usage
+        if usage:
+            stats.add_call(MODEL, usage.prompt_tokens, usage.completion_tokens, latency)
+        else:
+            in_t = count_tokens(prompt)
+            out_t = count_tokens(response.choices[0].message.content)
+            stats.add_call(MODEL, in_t, out_t, latency)
+            
         return response.choices[0].message.content
     except Exception as e:
         return f"Error summarizing content: {e}"
@@ -259,56 +382,88 @@ def summarize_content(client, content):
 def cap_messages(messages):
     if len(messages) <= MAX_MESSAGES:
         return messages
-    
-    # Keep the first message (usually system/initial user prompt) and the last N-1 messages
     return [messages[0]] + messages[-(MAX_MESSAGES-1):]
 
 
-def agent_loop(client, messages):
+def agent_loop(client, messages, stats: SessionStats, args):
     while True:
         messages = cap_messages(messages)
         
+        input_tokens = get_messages_tokens(messages)
+        
+        start_time = time.time()
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
             tools=TOOLS,
             max_tokens=2048,
-            stream=True
+            stream=True,
+            stream_options={"include_usage": True}
         )
 
         full_content = ""
         tool_calls_dict = {}
+        output_tokens = 0
 
-        for chunk in response:
-            if not chunk.choices:
-                continue
-            
-            delta = chunk.choices[0].delta
-            
-            if delta.content:
-                print(delta.content, end="", flush=True)
-                full_content += delta.content
-            
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_dict:
-                        tool_calls_dict[idx] = {
-                            "id": tc_delta.id,
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""}
-                        }
+        with Live(auto_refresh=False) as live:
+            for chunk in response:
+                if not chunk.choices:
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage = chunk.usage
+                        input_tokens = usage.prompt_tokens
+                        output_tokens = usage.completion_tokens
+                    continue
+                
+                delta = chunk.choices[0].delta
+                
+                if delta.content:
+                    full_content += delta.content
+                    output_tokens = count_tokens(full_content)
+                    live.update(
+                        Text.assemble(
+                            full_content,
+                            f"\n\n[dim italic]Tokens: {output_tokens}[/dim italic]"
+                        ),
+                        refresh=True
+                    )
+                
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = {
+                                "id": tc_delta.id,
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            }
+                        
+                        if tc_delta.id:
+                            tool_calls_dict[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls_dict[idx]["function"]["name"] += tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls_dict[idx]["function"]["arguments"] += tc_delta.function.arguments
                     
-                    if tc_delta.id:
-                        tool_calls_dict[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tool_calls_dict[idx]["function"]["name"] += tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tool_calls_dict[idx]["function"]["arguments"] += tc_delta.function.arguments
+                    live.update(
+                        Text.assemble(
+                            full_content,
+                            "\n\n[yellow]Calling tools...[/yellow]"
+                        ),
+                        refresh=True
+                    )
+            
+            # End of stream: render cleanly
+            if full_content:
+                live.update(Markdown(full_content), refresh=True)
+            else:
+                live.update(Text(""), refresh=True)
 
-        if full_content:
-            print()
+        latency = time.time() - start_time
+        stats.add_call(MODEL, input_tokens, output_tokens or count_tokens(full_content), latency)
+        
+        if args.response_stats:
+            stats.render_summary(stats.calls[-1])
 
         tool_calls = [tool_calls_dict[i] for i in sorted(tool_calls_dict.keys())]
         
@@ -325,11 +480,10 @@ def agent_loop(client, messages):
             for tc in tool_calls:
                 result = execute_tool(tc)
                 
-                # If it was a Fetch call, summarize the result if it's large
-                func_name = tc.function.name if hasattr(tc, "function") else tc["function"]["name"]
+                func_name = tc["function"]["name"]
                 if func_name == "Fetch" and len(result) > 1000:
-                    print(f"\n[Summarizing fetched content...]", file=sys.stderr)
-                    result = summarize_content(client, result)
+                    console.print(f"\n[Summarizing fetched content...]", style="dim italic")
+                    result = summarize_content(client, result, stats)
 
                 messages.append({
                     "role": "tool",
@@ -345,6 +499,8 @@ def parse_args():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-p", help="Prompt string")
     group.add_argument("--file", help="Path to prompt file")
+    parser.add_argument("--response-stats", action="store_true", help="Display per-response statistics")
+    parser.add_argument("--session-stats", action="store_true", help="Display session statistics at end")
     return parser.parse_args()
 
 
@@ -363,8 +519,13 @@ def main():
             prompt = f.read()
 
     messages = [{"role": "user", "content": prompt}]
+    stats = SessionStats()
 
-    agent_loop(client, messages)
+    try:
+        agent_loop(client, messages, stats, args)
+    finally:
+        if args.session_stats:
+            stats.render_session_stats()
 
 
 if __name__ == "__main__":
