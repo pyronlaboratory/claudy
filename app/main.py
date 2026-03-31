@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 
 from openai import OpenAI
 
@@ -80,6 +79,7 @@ def write_file(file_path, content):
         f.write(content)
     return "File written successfully"
 
+
 def run_bash(command):
     result = subprocess.run(
         command,
@@ -91,9 +91,17 @@ def run_bash(command):
     output = (result.stdout + result.stderr).strip()
     return output or "Command executed successfully"
 
+
 def execute_tool(tool_call):
-    func_name = tool_call.function.name
-    args = json.loads(tool_call.function.arguments)
+    # Support both object-like tool calls from non-streaming and dicts from streaming
+    if hasattr(tool_call, "function"):
+        func_name = tool_call.function.name
+        args_str = tool_call.function.arguments
+    else:
+        func_name = tool_call["function"]["name"]
+        args_str = tool_call["function"]["arguments"]
+    
+    args = json.loads(args_str)
 
     if func_name == "Read":
         return read_file(args["file_path"])
@@ -107,44 +115,78 @@ def execute_tool(tool_call):
     raise RuntimeError(f"Unknown tool {func_name}")
 
 
-def call_llm(client, messages):
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        tools=TOOLS,
-        max_tokens=1024
-    )
-
-    if not response.choices:
-        raise RuntimeError("no choices in response")
-
-    return response.choices[0].message
-
-
 def agent_loop(client, messages):
     while True:
-        print("Logs from your program will appear here!", file=sys.stderr)
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=1024,
+            stream=True
+        )
 
-        message = call_llm(client, messages)
-        messages.append(message)
+        full_content = ""
+        tool_calls_dict = {}
 
-        if message.tool_calls:
-            for tool_call in message.tool_calls:
-                result = execute_tool(tool_call)
+        for chunk in response:
+            if not chunk.choices:
+                continue
+            
+            delta = chunk.choices[0].delta
+            
+            if delta.content:
+                print(delta.content, end="", flush=True)
+                full_content += delta.content
+            
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_dict:
+                        tool_calls_dict[idx] = {
+                            "id": tc_delta.id,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        }
+                    
+                    if tc_delta.id:
+                        tool_calls_dict[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tool_calls_dict[idx]["function"]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_dict[idx]["function"]["arguments"] += tc_delta.function.arguments
 
+        if full_content:
+            print() # Newline after content stream
+
+        tool_calls = [tool_calls_dict[i] for i in sorted(tool_calls_dict.keys())]
+        
+        assistant_message = {
+            "role": "assistant",
+            "content": full_content or None,
+        }
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        
+        messages.append(assistant_message)
+
+        if tool_calls:
+            for tc in tool_calls:
+                result = execute_tool(tc)
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tc["id"],
                     "content": result
                 })
         else:
-            print(message.content)
             break
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-p", help="Prompt string")
+    group.add_argument("--file", help="Path to prompt file")
     return parser.parse_args()
 
 
@@ -156,122 +198,16 @@ def main():
 
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-    messages = [{"role": "user", "content": args.p}]
+    if args.p:
+        prompt = args.p
+    else:
+        with open(args.file, "r") as f:
+            prompt = f.read()
+
+    messages = [{"role": "user", "content": prompt}]
 
     agent_loop(client, messages)
 
 
 if __name__ == "__main__":
     main()
-
-#---------------------------------------
-# import argparse
-# import os
-# import sys
-# import json
-
-# from openai import OpenAI
-
-# API_KEY = os.getenv("OPENROUTER_API_KEY")
-# BASE_URL = os.getenv("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
-
-
-# def main():
-#     p = argparse.ArgumentParser()
-#     p.add_argument("-p", required=True)
-#     args = p.parse_args()
-
-#     if not API_KEY:
-#         raise RuntimeError("OPENROUTER_API_KEY is not set")
-
-#     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-#     messages = [{"role": "user", "content": args.p}]
-#     while True:
-#         chat = client.chat.completions.create(
-#             model="anthropic/claude-haiku-4.5",
-#             messages=messages, # [{"role": "user", "content": args.p}]
-#             max_tokens=1024,
-#             tools=[
-#                 {
-#                     "type": "function",
-#                     "function": {
-#                         "name": "Read",
-#                         "description": "Read and return the contents of a file",
-#                         "parameters": {
-#                             "type": "object",
-#                             "properties": {
-#                                 "file_path": {
-#                                     "type": "string",
-#                                     "description": "The path to the file to read"
-#                                 }
-#                             },
-#                             "required": ["file_path"]
-#                         }
-#                     }
-#                 },
-#                 {
-#                     "type": "function",
-#                     "function": {
-#                         "name": "Write",
-#                         "description": "Write content to a file",
-#                         "parameters": {
-#                             "type": "object",
-#                             "required": ["file_path", "content"],
-#                             "properties": {
-#                                 "file_path": {
-#                                     "type": "string",
-#                                     "description": "The path of the file to write to"
-#                                 },
-#                                 "content": {
-#                                     "type": "string",
-#                                     "description": "The content to write to the file"
-#                                 }
-#                             }
-#                         }
-#                     }
-#                 }
-#             ]
-#         )
-
-#         if not chat.choices or len(chat.choices) == 0:
-#             raise RuntimeError("no choices in response")
-
-#         # You can use print statements as follows for debugging, they'll be visible when running tests.
-#         print("Logs from your program will appear here!", file=sys.stderr)
-
-#         # print(chat.choices[0].message.content)
-
-#         message = chat.choices[0].message
-
-#         # Persist the message to maintain context in the conversation
-#         messages.append(message)
-#         if message.tool_calls:
-#             # Extract the first tool call
-#             tool_call = message.tool_calls[0]
-            
-#             # Parse the function name and args
-#             func_name = tool_call.function.name
-#             args = json.loads(tool_call.function.arguments)
-
-#             if func_name == "Read":
-#                 with open(args["file_path"], "r") as f:
-#                     result = f.read()
-            
-#             elif func_name == "Write":
-#                 with open(args["file_path"], "w") as f:
-#                     f.write(args["content"])
-#                 result = "File written successfully"
-
-#             # print(result)
-#             messages.append({
-#                 "role": "tool",
-#                 "tool_call_id": tool_call.id,
-#                 "content": result
-#             })
-#         else:
-#             print(message.content)
-#             break
-
-
-# if __name__ == "__main__":
-#     main()
