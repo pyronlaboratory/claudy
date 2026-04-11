@@ -1,0 +1,1 @@
+Compare the outputs of these 3 bash commands and explain what each tells you about the system: `uname -a`, `df -h`, and `ps aux --sort=-%mem | head -10`. Then write a short Python script to /tmp/sysinfo.py that collects all three and prints a formatted summary report.
