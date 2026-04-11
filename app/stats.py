@@ -12,7 +12,7 @@ from rich.table import Table
 from rich.text import Text
 from rich import box
 
-from app.config import DEFAULT_PRICING, MODEL, PRICING
+from app.config import DEFAULT_PRICING, PRICING
 
 console = Console()
 
@@ -164,7 +164,7 @@ class SessionStats:
         console.print()
 
 
-def count_tokens(text: str, model: str = MODEL) -> int:
+def count_tokens(text: str) -> int:
     try:
         encoding = tiktoken.encoding_for_model("gpt-4o")
         return len(encoding.encode(text))

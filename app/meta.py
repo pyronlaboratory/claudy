@@ -1,8 +1,6 @@
 import tomllib
 from pathlib import Path
 
-from app.config import MODEL
-
 
 def _load_project_meta() -> dict[str, str]:
     for directory in [Path(__file__).parent, Path(__file__).parent.parent]:
@@ -21,12 +19,15 @@ def _load_project_meta() -> dict[str, str]:
 PROJECT = _load_project_meta()
 
 
-def build_system_prompt(author: str = "Ronnie(github@pyronlaboratory)") -> str:
+def build_system_prompt(
+    model: str,
+    author: str = "Ronnie(github@pyronlaboratory)",
+) -> str:
     name = PROJECT["name"].capitalize()
     version = PROJECT["version"]
     return (
-        f"You are {name} v{version}, a command-line AI assistant built by {author}."
-        f"You are powered by large language model APIs (currently using {MODEL}) via OpenRouter, "
+        f"You are {name} v{version}, a light-weight command-line AI assistant built by {author}. "
+        f"You are powered by large language model APIs (currently using {model}), "
         f"and you have access to tools for reading/writing files, running shell commands, "
         f"searching the filesystem, and fetching URLs. "
         f"When asked about your identity, describe yourself in these terms — "

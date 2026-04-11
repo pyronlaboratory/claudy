@@ -13,7 +13,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.text import Text
 
-from app.config import MAX_MESSAGES, MAX_TOOL_OUTPUT_LENGTH, MODEL
+from app.config import MAX_MESSAGES, MAX_TOOL_OUTPUT_LENGTH, PROVIDER_MAX_TOKENS
 from app.stats import SessionStats, count_tokens, get_messages_tokens
 from app.tools import TOOLS, execute_tool
 
@@ -24,7 +24,9 @@ class AgentError(Exception):
     """Clean, user-facing agent error."""
 
 
-def summarize_content(client: OpenAI, content: str, stats: SessionStats) -> str:
+def summarize_content(
+    client: OpenAI, content: str, stats: SessionStats, model: str
+) -> str:
     prompt = (
         "Please provide a concise summary of the following content, "
         "focusing on key technical details relevant for a developer:\n\n"
@@ -33,17 +35,17 @@ def summarize_content(client: OpenAI, content: str, stats: SessionStats) -> str:
     try:
         start_time = time.time()
         response = client.chat.completions.create(
-            model=MODEL,
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500,
         )
         latency = time.time() - start_time
         usage = response.usage
         if usage:
-            stats.add_call(MODEL, usage.prompt_tokens, usage.completion_tokens, latency)
+            stats.add_call(model, usage.prompt_tokens, usage.completion_tokens, latency)
         else:
             stats.add_call(
-                MODEL,
+                model,
                 count_tokens(prompt),
                 count_tokens(response.choices[0].message.content or ""),
                 latency,
@@ -72,7 +74,7 @@ def _raise_status_error(e: APIStatusError) -> None:
     if status == 402:
         raise AgentError(f"Out of credits — {detail}")
     elif status == 401:
-        raise AgentError("Authentication failed — check your OPENROUTER_API_KEY.")
+        raise AgentError("Authentication failed — check your API key.")
     elif status == 429:
         raise AgentError("Rate limited — too many requests, slow down and retry.")
     elif status == 503:
@@ -82,10 +84,13 @@ def _raise_status_error(e: APIStatusError) -> None:
 
 
 def _stream_response(
-    client: OpenAI, messages: list[ChatCompletionMessageParam]
+    client: OpenAI,
+    messages: list[ChatCompletionMessageParam],
+    model: str,
+    provider: str = "openrouter",
 ) -> tuple[str, list[dict], int, int, float]:
     """
-    Stream one LLM turn.
+    Stream one LLM turn with exponential backoff for rate limits.
 
     Returns:
         (full_content, tool_calls, input_tokens, output_tokens, latency)
@@ -94,24 +99,41 @@ def _stream_response(
         AgentError on API-level failures.
     """
     input_tokens = get_messages_tokens(messages)
+    max_tokens = PROVIDER_MAX_TOKENS.get(provider, 1024)
     start_time = time.time()
-    response = None
+    
+    max_retries = 3
+    retry_delay = 2.0
 
-    try:
-        response = client.chat.completions.create(  # type: ignore[call-overload]
-            model=MODEL,
-            messages=messages,
-            tools=cast(list[ChatCompletionToolParam], TOOLS),
-            max_tokens=2048,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-    except APIStatusError as e:
-        _raise_status_error(e)
-    except APITimeoutError:
-        raise AgentError("Request timed out — the API took too long to respond.")
-    except APIConnectionError:
-        raise AgentError("Connection failed — check your network and try again.")
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.chat.completions.create(  # type: ignore[call-overload]
+                model=model,
+                messages=messages,
+                tools=cast(list[ChatCompletionToolParam], TOOLS),
+                max_tokens=max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            break
+        except APIStatusError as e:
+            if e.status_code in (429, 503) and attempt < max_retries:
+                console.print(f"  [dim]Rate limited, retrying in {retry_delay}s...[/dim]")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            _raise_status_error(e)
+        except APITimeoutError:
+            if attempt < max_retries:
+                continue
+            raise AgentError("Request timed out — the API took too long to respond.")
+        except APIConnectionError:
+            if attempt < max_retries:
+                continue
+            raise AgentError("Connection failed — check your network and try again.")
+    else:
+        # Should not be reachable due to _raise_status_error or raise AgentError
+        raise AgentError("Maximum retries exceeded.")
 
     full_content = ""
     tool_calls_dict: dict[int, dict] = {}
@@ -196,19 +218,21 @@ def agent_loop(
     messages: list[ChatCompletionMessageParam],
     stats: SessionStats,
     args,
+    model: str,
+    provider: str = "openrouter",
 ) -> None:
     while True:
         messages = _cap_messages(messages)
 
         try:
             full_content, tool_calls, input_tokens, output_tokens, latency = (
-                _stream_response(client, messages)
+                _stream_response(client, messages, model, provider)
             )
         except AgentError as e:
             console.print(f"\n[red]✗[/red] [bold]{e}[/bold]")
             return
 
-        stats.add_call(MODEL, input_tokens, output_tokens, latency)
+        stats.add_call(model, input_tokens, output_tokens, latency)
         if args.response_stats:
             stats.render_summary(stats.calls[-1])
 
@@ -238,7 +262,7 @@ def agent_loop(
 
             if func_name == "Fetch" and len(result) > 1000:
                 console.print("[dim]summarizing…[/dim]")
-                result = summarize_content(client, result, stats)
+                result = summarize_content(client, result, stats, model)
             else:
                 console.print(Text.assemble(("done", "dim green")))
 
